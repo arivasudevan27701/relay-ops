@@ -4,7 +4,7 @@
   "main": "src/server.ts",
   "compatibility_date": "2026-09-20",
   "compatibility_flags": ["nodejs_compat"],
-  "ai": { "binding": "AI" },
+  "ai": { "binding": "AI", "remote": true },
   "assets": {
     "directory": "./public",
     "not_found_handling": "single-page-application",
@@ -14,7 +14,7 @@
     {
       "binding": "DB",
       "database_name": "relay-ops",
-      "database_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+      "database_id": "787dbcd3-011f-4b6b-a704-9f572c7c135e"
     }
   ],
   "durable_objects": {

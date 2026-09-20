@@ -11,30 +11,14 @@ import { MAX_RESOURCES, SIZE_GIB } from "./types";
 
 export async function ensureSchema(db: D1Database): Promise<void> {
   await db.exec(
-    `CREATE TABLE IF NOT EXISTS resources (
-      id TEXT PRIMARY KEY,
-      desk_id TEXT NOT NULL,
-      kind TEXT NOT NULL,
-      name TEXT NOT NULL,
-      team TEXT NOT NULL,
-      region TEXT NOT NULL,
-      size TEXT NOT NULL,
-      status TEXT NOT NULL,
-      endpoint TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-    CREATE UNIQUE INDEX IF NOT EXISTS resources_desk_name ON resources(desk_id, name);
-    CREATE TABLE IF NOT EXISTS jobs (
-      id TEXT PRIMARY KEY,
-      desk_id TEXT NOT NULL,
-      action TEXT NOT NULL,
-      resource_name TEXT NOT NULL,
-      status TEXT NOT NULL,
-      detail TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );`
+    "CREATE TABLE IF NOT EXISTS resources (id TEXT PRIMARY KEY, desk_id TEXT NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL, team TEXT NOT NULL, region TEXT NOT NULL, size TEXT NOT NULL, status TEXT NOT NULL, endpoint TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+  );
+  await db.exec("DROP INDEX IF EXISTS resources_desk_name");
+  await db.exec(
+    "CREATE UNIQUE INDEX IF NOT EXISTS resources_desk_name_live ON resources (desk_id, name) WHERE status != 'gone'"
+  );
+  await db.exec(
+    "CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, desk_id TEXT NOT NULL, action TEXT NOT NULL, resource_name TEXT NOT NULL, status TEXT NOT NULL, detail TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
   );
 }
 

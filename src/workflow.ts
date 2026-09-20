@@ -72,6 +72,7 @@ export class InfraWorkflow extends WorkflowEntrypoint<Env, JobParams> {
 
   private async provision(step: WorkflowStep, params: JobParams, jobId: string) {
     const existing = await step.do("validate", async () => {
+      await this.mark(jobId, params, "validating");
       const current = await getByName(this.env.DB, params.deskId, params.name);
       if (current) {
         return {
@@ -98,6 +99,7 @@ export class InfraWorkflow extends WorkflowEntrypoint<Env, JobParams> {
     await step.sleep("wait for allocator", "1 second");
 
     const allocated = await step.do("allocate", async () => {
+      await this.mark(jobId, params, "allocating");
       const now = new Date().toISOString();
       const row: ResourceRow = {
         id: crypto.randomUUID(),
@@ -113,20 +115,13 @@ export class InfraWorkflow extends WorkflowEntrypoint<Env, JobParams> {
         updated_at: now
       };
       await insertResource(this.env.DB, row);
-      await upsertJob(this.env.DB, {
-        id: jobId,
-        deskId: params.deskId,
-        action: params.action,
-        resourceName: params.name,
-        status: "running",
-        detail: "allocated"
-      });
       return row;
     });
 
     await step.sleep("wait for config plane", "1 second");
 
     const configured = await step.do("configure", async () => {
+      await this.mark(jobId, params, "configuring");
       const endpoint = endpointFor(params.kind, params.name, params.region);
       await patchResource(this.env.DB, allocated.id, {
         status: "configuring",
@@ -136,6 +131,7 @@ export class InfraWorkflow extends WorkflowEntrypoint<Env, JobParams> {
     });
 
     const healthy = await step.do("healthcheck", STEP_RETRY, async () => {
+      await this.mark(jobId, params, "healthcheck");
       if (params.name.includes("broken")) {
         throw new Error(`healthcheck failed for ${params.name}: mock probe refused`);
       }
@@ -161,6 +157,7 @@ export class InfraWorkflow extends WorkflowEntrypoint<Env, JobParams> {
 
   private async restart(step: WorkflowStep, params: JobParams, jobId: string) {
     const found = await step.do("find resource", async () => {
+      await this.mark(jobId, params, "draining");
       const row = await getByName(this.env.DB, params.deskId, params.name);
       if (!row) throw new Error(`no live resource named ${params.name}`);
       await patchResource(this.env.DB, row.id, { status: "restarting" });
@@ -170,19 +167,12 @@ export class InfraWorkflow extends WorkflowEntrypoint<Env, JobParams> {
     await step.sleep("drain connections", "1 second");
 
     await step.do("healthcheck after restart", STEP_RETRY, async () => {
+      await this.mark(jobId, params, "healthcheck");
       if (params.name.includes("broken")) {
         await patchResource(this.env.DB, found.id, { status: "failed" });
         throw new Error(`restart healthcheck failed for ${params.name}`);
       }
       await patchResource(this.env.DB, found.id, { status: "running" });
-      await upsertJob(this.env.DB, {
-        id: jobId,
-        deskId: params.deskId,
-        action: params.action,
-        resourceName: params.name,
-        status: "running",
-        detail: "healthcheck passed"
-      });
       return { ok: true };
     });
 
@@ -193,8 +183,9 @@ export class InfraWorkflow extends WorkflowEntrypoint<Env, JobParams> {
     };
   }
 
-  private async teardown(step: WorkflowStep, params: JobParams, _jobId: string) {
+  private async teardown(step: WorkflowStep, params: JobParams, jobId: string) {
     const found = await step.do("find resource", async () => {
+      await this.mark(jobId, params, "draining");
       const row = await getByName(this.env.DB, params.deskId, params.name);
       if (!row) throw new Error(`no live resource named ${params.name}`);
       await patchResource(this.env.DB, row.id, { status: "draining" });
@@ -204,6 +195,7 @@ export class InfraWorkflow extends WorkflowEntrypoint<Env, JobParams> {
     await step.sleep("drain before destroy", "1 second");
 
     await step.do("destroy", async () => {
+      await this.mark(jobId, params, "destroy");
       await patchResource(this.env.DB, found.id, { status: "gone", endpoint: null });
       return { ok: true };
     });
@@ -211,8 +203,9 @@ export class InfraWorkflow extends WorkflowEntrypoint<Env, JobParams> {
     return { ok: true, destroyed: found.name, id: found.id };
   }
 
-  private async status(step: WorkflowStep, params: JobParams, _jobId: string) {
+  private async status(step: WorkflowStep, params: JobParams, jobId: string) {
     return await step.do("probe", async () => {
+      await this.mark(jobId, params, "probe");
       const row = await getByName(this.env.DB, params.deskId, params.name);
       if (!row) return { ok: false, message: `no live resource named ${params.name}` };
       return {
@@ -220,6 +213,17 @@ export class InfraWorkflow extends WorkflowEntrypoint<Env, JobParams> {
         probe: row.status === "running" ? "healthy" : row.status,
         resource: row
       };
+    });
+  }
+
+  private mark(jobId: string, params: JobParams, detail: string) {
+    return upsertJob(this.env.DB, {
+      id: jobId,
+      deskId: params.deskId,
+      action: params.action,
+      resourceName: params.name,
+      status: "running",
+      detail
     });
   }
 }

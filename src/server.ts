@@ -1,160 +1,269 @@
 import { AIChatAgent } from "@cloudflare/ai-chat";
-import { routeAgentRequest } from "agents";
+import { Agent, routeAgentRequest } from "agents";
 import { createWorkersAI } from "workers-ai-provider";
-import {
-  convertToModelMessages,
-  pruneMessages,
-  stepCountIs,
-  streamText,
-  tool
-} from "ai";
-import { z } from "zod";
+import { createUIMessageStream, createUIMessageStreamResponse, generateText } from "ai";
+import { extractIntent, MODEL } from "./extract";
+import { parseOps, type ParsedIntent } from "./intent";
 import { ensureSchema, getByName, listJobs, listResources } from "./inventory";
 import { InfraWorkflow } from "./workflow";
 import {
-  ACTIONS,
   DESK_ID,
-  KINDS,
-  REGIONS,
-  SIZES,
-  type Action,
+  REGION_LABEL,
   type JobParams,
-  type Kind,
-  type Region,
   type RelayState,
-  type Size
+  type ResourceRow
 } from "./types";
 
 export { InfraWorkflow };
 
-const MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+type SpanAttrs = Record<string, unknown>;
+type AgentWithSpan = {
+  _withAgentSpan(
+    operation: string,
+    storagePhase: string,
+    attributes: SpanAttrs,
+    run: (update: (attrs: SpanAttrs) => void) => unknown
+  ): unknown;
+};
 
-const SYSTEM = `You are Relay, the chat control plane for internal infrastructure.
+const agentProto = Agent.prototype as unknown as AgentWithSpan;
+if (typeof agentProto._withAgentSpan !== "function") {
+  agentProto._withAgentSpan = (_operation, _storagePhase, _attributes, run) => run(() => {});
+}
 
-You do not provision machines yourself. You dispatch durable jobs (Cloudflare Workflows) and report their results.
+const CHAT_SYSTEM = `You are Relay, a terse infra ops desk.
+One short sentence. No JSON, no tool names, no key=value dumps.
+If they greet you, say you can provision, restart, or tear down fleet resources.`;
 
-Rules:
-- Always use tools for fleet facts. Never invent endpoints, job ids, or inventory.
-- Map casual language to tools: "spin up", "stand up", "give me" → provision. "bounce" / "recycle" → restart. "kill" / "delete" / "tear down" → teardown. "is it up" → status. "what do we have" → listFleet.
-- Default team to "platform", region to "iad", size to "small" when the operator omits them.
-- Map city names: London/UK → lhr, Virginia/US-East/Ashburn → iad, Singapore → sin, Sydney/Australia → syd.
-- Map size: 1GB/small → small, 4GB/medium → medium, 16GB/large → large.
-- Resource names should be dns-safe kebab-case. If the operator says "staging redis for payments", name it payments-cache unless they gave a name.
-- After dispatchJob, tell them the job id and that the workflow is running validate → allocate → configure → healthcheck.
-- If they say "the last one" / "that redis", call recallContext first.
-- Be terse. This is an ops desk, not a chatbot. No filler.
-- Teardown is destructive and requires operator approval in the UI.`;
+function lastUserText(messages: Array<{ role: string; parts: Array<{ type: string; text?: string }> }>): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg.role !== "user") continue;
+    return msg.parts
+      .map((part) => (part.type === "text" && part.text ? part.text : ""))
+      .join(" ")
+      .trim();
+  }
+  return "";
+}
+
+function say(text: string) {
+  return createUIMessageStreamResponse({
+    stream: createUIMessageStream({
+      execute({ writer }) {
+        const id = crypto.randomUUID();
+        writer.write({ type: "text-start", id });
+        writer.write({ type: "text-delta", id, delta: text });
+        writer.write({ type: "text-end", id });
+      }
+    })
+  });
+}
+
+function where(region: string | undefined): string {
+  if (!region) return "";
+  return REGION_LABEL[region as keyof typeof REGION_LABEL] ?? region;
+}
+
+function phraseOps(
+  intent: ParsedIntent,
+  facts: {
+    error?: string;
+    count?: number;
+    resources?: ResourceRow[];
+    needsApproval?: boolean;
+    cancelled?: boolean;
+    name?: string;
+    kind?: string;
+    region?: string;
+    ok?: boolean;
+    jobId?: string;
+    dispatched?: JobParams;
+    jobs?: Array<{ action: string; resource_name: string; status: string }>;
+    state?: RelayState;
+  }
+): string {
+  if (facts.error) return facts.error;
+  if (intent.type === "list") {
+    const rows = facts.resources ?? [];
+    if (!rows.length) return "Fleet is empty.";
+    return rows
+      .map((row) => `${row.name} · ${row.kind} · ${where(row.region)} · ${row.status}`)
+      .join("\n");
+  }
+  if (facts.needsApproval && facts.name) {
+    return `Teardown of ${facts.name} is destructive. Approve it below.`;
+  }
+  if (facts.cancelled && facts.name) return `Left ${facts.name} running.`;
+  if (intent.type === "recall") {
+    const last = facts.state?.lastResourceName;
+    const jobs = facts.jobs ?? [];
+    if (!last && !jobs.length) return "No jobs on this desk yet.";
+    const recent = jobs[0];
+    return last
+      ? `Last resource is ${last}${recent ? `; last job ${recent.action} is ${recent.status}` : ""}.`
+      : `Last job ${recent.action} on ${recent.resource_name} is ${recent.status}.`;
+  }
+  if (facts.ok && facts.jobId && facts.dispatched) {
+    const job = facts.dispatched;
+    const place = where(job.region);
+    const loc = place ? ` in ${place}` : "";
+    if (job.action === "provision") {
+      return `Provisioning ${job.name}${loc}. Job ${facts.jobId} is running.`;
+    }
+    if (job.action === "restart") {
+      return `Restarting ${job.name}${loc}. Job ${facts.jobId} is running.`;
+    }
+    if (job.action === "teardown") {
+      return `Tearing down ${job.name}${loc}. Job ${facts.jobId} is running.`;
+    }
+    return `Checking ${job.name}${loc}. Job ${facts.jobId} is running.`;
+  }
+  return "Nothing to report.";
+}
 
 export class RelayAgent extends AIChatAgent<Env, RelayState> {
   initialState: RelayState = {
     lastJobId: null,
     lastAction: null,
-    lastResourceName: null
+    lastResourceName: null,
+    pendingTeardown: null
   };
 
   async onChatMessage(_onFinish: unknown, options?: { abortSignal?: AbortSignal }) {
-    const workersai = createWorkersAI({ binding: this.env.AI });
-    const deskId = this.name || DESK_ID;
+    const deskId = DESK_ID;
+    const userText = lastUserText(this.messages);
 
-    const result = streamText({
-      model: workersai(MODEL),
-      system: SYSTEM,
-      messages: pruneMessages({
-        messages: await convertToModelMessages(this.messages),
-        toolCalls: "before-last-2-messages"
-      }),
-      tools: {
-        listFleet: tool({
-          description: "List live resources on this ops desk.",
-          inputSchema: z.object({}),
-          execute: async () => {
-            await ensureSchema(this.env.DB);
-            const resources = await listResources(this.env.DB, deskId);
-            return { deskId, count: resources.length, resources };
-          }
-        }),
+    await ensureSchema(this.env.DB);
+    const resources = await listResources(this.env.DB, deskId);
+    const jobs = await listJobs(this.env.DB, deskId);
+    const lastName =
+      this.state.lastResourceName ?? resources[0]?.name ?? jobs[0]?.resource_name ?? null;
+    const hydrated: RelayState = { ...this.state, lastResourceName: lastName };
 
-        recallContext: tool({
-          description:
-            "Recall the last dispatched job and resource for this desk, plus recent jobs.",
-          inputSchema: z.object({}),
-          execute: async () => {
-            await ensureSchema(this.env.DB);
-            const jobs = await listJobs(this.env.DB, deskId);
-            return { state: this.state, jobs };
-          }
-        }),
+    let intent = parseOps(userText, hydrated);
+    const localGate =
+      Boolean(this.state.pendingTeardown) &&
+      (intent.type === "cancel-teardown" ||
+        (intent.type === "job" &&
+          intent.action === "teardown" &&
+          /\b(approve|confirm|yes)\b/i.test(userText)));
 
-        getJobStatus: tool({
-          description: "Read a workflow instance by job id.",
-          inputSchema: z.object({
-            jobId: z.string().describe("Workflow instance id")
-          }),
-          execute: async ({ jobId }) => {
-            const instance = await this.env.INFRA_WORKFLOW.get(jobId);
-            return await instance.status();
-          }
-        }),
+    if (!localGate) {
+      const extracted = await extractIntent(
+        this.env,
+        userText,
+        hydrated,
+        resources.map((row) => row.name),
+        options
+      );
+      intent = extracted ?? parseOps(userText, hydrated);
+    }
 
-        dispatchJob: tool({
-          description:
-            "Dispatch a durable infra job: provision, restart, teardown, or status.",
-          inputSchema: z.object({
-            action: z.enum(ACTIONS),
-            kind: z.enum(KINDS),
-            name: z
-              .string()
-              .regex(/^[a-z0-9][a-z0-9-]*$/)
-              .describe("dns-safe resource name"),
-            team: z.string().default("platform"),
-            region: z.enum(REGIONS).default("iad"),
-            size: z.enum(SIZES).default("small")
-          }),
-          needsApproval: async ({ action }) => action === "teardown",
-          execute: async ({ action, kind, name, team, region, size }) => {
-            await ensureSchema(this.env.DB);
+    if (intent.type === "chat") {
+      const workersai = createWorkersAI({ binding: this.env.AI });
+      const { text } = await generateText({
+        model: workersai(MODEL),
+        system: CHAT_SYSTEM,
+        prompt: userText || "hello",
+        abortSignal: options?.abortSignal
+      });
+      return say(text.trim() || "Relay. Provision, restart, or tear down from this desk.");
+    }
 
-            if (action !== "provision") {
-              const found = await getByName(this.env.DB, deskId, name);
-              if (!found && action !== "status") {
-                return {
-                  ok: false,
-                  error: `no live resource named ${name} on desk ${deskId}`
-                };
-              }
-            }
-
-            const params: JobParams = {
-              action: action as Action,
-              kind: kind as Kind,
-              name,
-              team: team || "platform",
-              region: (region || "iad") as Region,
-              size: (size || "small") as Size,
-              deskId
-            };
-
-            const instance = await this.env.INFRA_WORKFLOW.create({ params });
-            this.setState({
-              lastJobId: instance.id,
-              lastAction: params.action,
-              lastResourceName: params.name
-            });
-
-            return {
-              ok: true,
-              jobId: instance.id,
-              dispatched: params,
-              note: "workflow running; poll getJobStatus or the job panel"
+    let facts: Parameters<typeof phraseOps>[1] = {};
+    try {
+      if (intent.type === "list") {
+        facts = { count: resources.length, resources };
+      } else if (intent.type === "recall") {
+        facts = {
+          state: { ...this.state, lastResourceName: lastName },
+          jobs
+        };
+      } else if (intent.type === "cancel-teardown") {
+        const name = this.state.pendingTeardown;
+        this.patchState({ pendingTeardown: null });
+        facts = { cancelled: true, name: name ?? "resource" };
+      } else if (intent.type === "job" && intent.action === "teardown") {
+        const approved =
+          Boolean(this.state.pendingTeardown) &&
+          this.state.pendingTeardown === intent.name &&
+          /\b(approve|confirm|yes)\b/i.test(userText);
+        if (!approved) {
+          const found = await getByName(this.env.DB, deskId, intent.name);
+          if (!found) {
+            facts = { error: `no live resource named ${intent.name} on desk ${deskId}` };
+          } else {
+            this.patchState({ pendingTeardown: intent.name });
+            facts = {
+              needsApproval: true,
+              name: found.name,
+              kind: found.kind,
+              region: found.region
             };
           }
-        })
-      },
-      stopWhen: stepCountIs(8),
-      abortSignal: options?.abortSignal
+        } else {
+          facts = await this.dispatch({
+            action: intent.action,
+            kind: intent.kind,
+            name: intent.name,
+            team: intent.team,
+            region: intent.region,
+            size: intent.size,
+            deskId
+          });
+        }
+      } else if (intent.type === "job") {
+        facts = await this.dispatch({
+          action: intent.action,
+          kind: intent.kind,
+          name: intent.name,
+          team: intent.team,
+          region: intent.region,
+          size: intent.size,
+          deskId
+        });
+      }
+    } catch (error) {
+      facts = { error: error instanceof Error ? error.message : String(error) };
+    }
+
+    return say(phraseOps(intent, facts));
+  }
+
+  private patchState(patch: Partial<RelayState>) {
+    this.setState({ ...this.state, ...patch });
+  }
+
+  private async dispatch(params: JobParams) {
+    const live =
+      params.action === "provision" ? null : await getByName(this.env.DB, params.deskId, params.name);
+    if (params.action !== "provision" && !live && params.action !== "status") {
+      return { error: `no live resource named ${params.name} on desk ${params.deskId}` };
+    }
+
+    const hydrated: JobParams = live
+      ? {
+          ...params,
+          kind: live.kind,
+          team: live.team,
+          region: live.region,
+          size: live.size
+        }
+      : params;
+
+    const instance = await this.env.INFRA_WORKFLOW.create({ params: hydrated });
+    this.patchState({
+      lastJobId: instance.id,
+      lastAction: hydrated.action,
+      lastResourceName: hydrated.name,
+      pendingTeardown: hydrated.action === "teardown" ? null : this.state.pendingTeardown
     });
-
-    return result.toUIMessageStreamResponse();
+    return {
+      ok: true as const,
+      jobId: instance.id,
+      dispatched: hydrated
+    };
   }
 }
 
@@ -184,9 +293,9 @@ export default {
       }
     }
 
-    return (
-      (await routeAgentRequest(request, env)) ||
-      new Response("Not found", { status: 404 })
-    );
+    const agentResponse = await routeAgentRequest(request, env);
+    if (agentResponse) return agentResponse;
+
+    return new Response("Not found", { status: 404 });
   }
 } satisfies ExportedHandler<Env>;

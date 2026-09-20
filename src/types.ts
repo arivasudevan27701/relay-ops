@@ -55,6 +55,7 @@ export type RelayState = {
   lastJobId: string | null;
   lastAction: Action | null;
   lastResourceName: string | null;
+  pendingTeardown: string | null;
 };
 
 export const MAX_RESOURCES = 8;
