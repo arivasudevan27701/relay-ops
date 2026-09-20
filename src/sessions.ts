@@ -84,3 +84,12 @@ export function createSession(sessions: ChatSession[]): ChatSession {
   if (unused) return unused;
   return blank();
 }
+
+/** Always open a fresh thread. Untitled drafts are dropped so New chat is never a no-op. */
+export function startNewChat(sessions: ChatSession[]): { sessions: ChatSession[]; activeId: string } {
+  const created = blank();
+  return {
+    sessions: [created, ...sessions.filter((row) => row.title)],
+    activeId: created.id
+  };
+}

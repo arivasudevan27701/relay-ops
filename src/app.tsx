@@ -8,6 +8,7 @@ import {
   createSession,
   loadSessions,
   persistSessions,
+  startNewChat,
   titleFrom
 } from "./sessions";
 
@@ -62,11 +63,8 @@ export function App() {
   };
 
   const onNewChat = () => {
-    const created = createSession(sessions);
-    const next = sessions.some((row) => row.id === created.id)
-      ? sessions
-      : [created, ...sessions];
-    commit(next, created.id);
+    const next = startNewChat(sessions);
+    commit(next.sessions, next.activeId);
   };
 
   const onOpenChat = (id: string) => commit(sessions, id);
@@ -242,7 +240,10 @@ function ChatThread({
   const scroller = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLInputElement>(null);
 
-  const { messages, sendMessage, addToolApprovalResponse, status } = useAgentChat({ agent });
+  const { messages, sendMessage, addToolApprovalResponse, status } = useAgentChat({
+    agent,
+    id: sessionId
+  });
 
   useEffect(() => {
     scroller.current?.scrollTo({ top: scroller.current.scrollHeight, behavior: "smooth" });

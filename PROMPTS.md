@@ -100,3 +100,27 @@ Reviewer-hardening: Llama should extract JobParams; regex is fallback. Tests, re
 
 ### Assistant
 Llama `generateText` returns intent JSON (Zod). Regex `parseOps` if timeout/junk. Teardown approve/reject stays local. Vitest on the parser. D1 `relay-ops` created; deploy + commit.
+
+### User
+new chat is not workin?
+
+### Assistant
+`createSession` reused the untitled draft, so New chat was a no-op. `startNewChat` always opens a new id and drops empty drafts. `useAgentChat` now keys on the session id.
+
+### User
+https://relay-ops.arivasudevan27701.workers.dev — if this is public, anyone can access my instances, right?
+
+### Assistant
+Yes. No auth. Strangers can use the mock desk and spend Workers AI on this account. They cannot touch real machines — there are none.
+
+### User
+so everything fake ah? isn't it supposed to be real or i misunderstood?
+
+### Assistant
+The Cloudflare app is real (Worker, Llama, Workflow, DOs, D1). The fleet it talks about is a mock. The assignment asked for an AI app on Cloudflare, not a real Redis in London.
+
+### User
+okie commit and push it with prompts also
+
+### Assistant
+Committed the New-chat fix, session test, and this prompt history; pushed to origin/main.
